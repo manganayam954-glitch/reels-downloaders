@@ -106,6 +106,41 @@ Returns `{ "supported": ["facebook", "instagram", "tiktok", "youtube"] }`.
   via `yt-dlp` (see the
   [yt-dlp cookies wiki](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp)).
 
+## Deploying
+
+### Backend on Render (free, Docker)
+
+The repo ships a [`render.yaml`](./render.yaml) blueprint:
+
+1. Sign in at <https://dashboard.render.com>.
+2. Click **New** → **Blueprint** → connect this GitHub repo.
+3. Render reads `render.yaml`, builds `backend/Dockerfile`, and gives you a
+   public URL like `https://reels-downloaders-api.onrender.com`.
+4. Free-tier services spin down after ~15 min of idle traffic; the first
+   request after a sleep takes ~30–60 s while the container wakes.
+
+### Backend on Fly.io (alternative)
+
+A `backend/fly.toml` is included for `fly launch --copy-config` if you'd
+rather use [Fly.io](https://fly.io). Make sure your org has machines
+available; otherwise `fly deploy` will fail with a machine-limit error.
+
+### Frontend on any static host
+
+```bash
+cd frontend
+echo "VITE_API_BASE_URL=https://your-deployed-backend.onrender.com" > .env
+npm run build
+```
+
+Upload the resulting `frontend/dist/` folder to Netlify, Vercel, Cloudflare
+Pages, or any other static host.
+
+## Contributing
+
+Pull requests welcome — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the
+full workflow (lint, tests, conventional commits).
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
