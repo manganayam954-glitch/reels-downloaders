@@ -1,0 +1,22 @@
+# Render Blueprint for Reels Downloaders.
+# Render docs: https://render.com/docs/blueprint-spec
+#
+# After signing in to https://dashboard.render.com:
+#   1. Click "New" -> "Blueprint"
+#   2. Connect this GitHub repo (manganayam954-glitch/reels-downloaders)
+#   3. Render reads this file and provisions the backend service
+#
+services:
+  - type: web
+    name: reels-downloaders-api
+    runtime: docker
+    repo: https://github.com/manganayam954-glitch/reels-downloaders
+    branch: main
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
