@@ -128,7 +128,7 @@ function App() {
               <Wand2 className="h-4 w-4" />
             </span>
             <span className="text-base font-bold tracking-tight text-white">
-              Reels<span className="text-gradient">Grab</span>
+              <span className="text-gradient">BAYONG</span>
             </span>
           </a>
           <a
