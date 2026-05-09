@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -311,6 +312,42 @@ def extract_info(url: str) -> VideoInfo:
     return _normalize_info(raw, platform)
 
 
+_BASE_YTDLP_FLAGS: tuple[str, ...] = (
+    "--no-playlist",
+    "--quiet",
+    "--no-warnings",
+    # Mirror the timeout / retry settings from `_ydl_opts` so the
+    # streaming path is just as resilient to flaky upstream TLS as
+    # the metadata path.
+    "--socket-timeout",
+    "30",
+    "--retries",
+    "5",
+    "--fragment-retries",
+    "5",
+    "--extractor-retries",
+    "5",
+    # Mirror `extractor_args` from `_ydl_opts` -- some Meta extractors
+    # have alternate APIs that work better in 2026.
+    "--extractor-args",
+    "instagram:api=graphql",
+)
+
+
+def _selector_needs_merging(selector: str) -> bool:
+    """Return True if a yt-dlp format selector requires merging two streams.
+
+    yt-dlp can stream a single muxed format directly to stdout, but a
+    selector like ``bv*+ba`` or ``137+140`` produces two separate streams
+    that must be muxed via ffmpeg into a real MP4 -- and MP4 muxing needs a
+    seekable output (the ``moov`` atom must be patched in at the end), so we
+    can't pipe to stdout.  In that case we download to a tempfile and stream
+    that back instead.
+    """
+
+    return "+" in selector or "bv" in selector or "ba" in selector
+
+
 def stream_download(
     url: str,
     *,
@@ -320,15 +357,46 @@ def stream_download(
 
     Returns ``(byte_iterator, suggested_filename, content_type)``.
 
-    Implementation note: we shell out to ``yt-dlp -o -`` so it can write the
-    muxed result to stdout without us having to manage a temp file.  This is
-    the same approach the official docs recommend for streaming.
+    For *progressive* formats (audio + video already muxed by the platform,
+    common on TikTok / Facebook), we shell out to ``yt-dlp -o -`` so the
+    bytes flow through stdout with zero filesystem footprint.
+
+    For *DASH* formats (audio + video as separate streams, common on
+    Instagram / YouTube), we download to a tempfile, ask yt-dlp to remux
+    into MP4, and then stream the tempfile back to the client -- because
+    you cannot mux MP4 to a non-seekable stdout pipe.
     """
 
     info = extract_info(url)
     selector = format_selector or info.best_format_id or "best"
 
     safe_title = re.sub(r"[^\w\-. ]+", "_", info.title).strip("._ ") or "video"
+    platform = detect_platform(url)
+
+    if _selector_needs_merging(selector):
+        return _download_via_tempfile(
+            url=url,
+            selector=selector,
+            safe_title=safe_title,
+            platform=platform,
+        )
+    return _stream_stdout(
+        url=url,
+        selector=selector,
+        safe_title=safe_title,
+        platform=platform,
+        info=info,
+    )
+
+
+def _stream_stdout(
+    *,
+    url: str,
+    selector: str,
+    safe_title: str,
+    platform: Platform,
+    info: VideoInfo,
+) -> tuple[Iterator[bytes], str, str]:
     ext = "mp4"
     for fmt in info.formats:
         if fmt.format_id == selector and fmt.ext:
@@ -336,43 +404,16 @@ def stream_download(
             break
     filename = f"{safe_title}.{ext}"
 
-    platform = detect_platform(url)
-
-    # Invoke via the current Python interpreter so we use the same yt-dlp
-    # that the rest of the app imports -- no PATH lookups needed.
-    cmd = [
-        sys.executable,
-        "-m",
-        "yt_dlp",
-        "--no-playlist",
-        "--quiet",
-        "--no-warnings",
-        # Mirror the timeout / retry settings from `_ydl_opts` so the
-        # streaming path is just as resilient to flaky upstream TLS as
-        # the metadata path.
-        "--socket-timeout",
-        "30",
-        "--retries",
-        "5",
-        "--fragment-retries",
-        "5",
-        "--extractor-retries",
-        "5",
-        # Mirror `extractor_args` from `_ydl_opts` -- some Meta extractors
-        # have alternate APIs that work better in 2026.
-        "--extractor-args",
-        "instagram:api=graphql",
-    ]
-
+    cmd: list[str] = [sys.executable, "-m", "yt_dlp", *_BASE_YTDLP_FLAGS]
     cookiefile = _resolve_cookiefile(platform)
     if cookiefile:
         cmd.extend(["--cookies", cookiefile])
-
     cmd.extend(["-f", selector, "-o", "-", url])
     logger.info(
-        "Spawning yt-dlp for streaming (platform=%s, cookies=%s)",
+        "Spawning yt-dlp for stdout streaming (platform=%s, cookies=%s, selector=%s)",
         platform,
         bool(cookiefile),
+        selector,
     )
 
     proc = subprocess.Popen(  # noqa: S603 - args are constructed safely above
@@ -405,6 +446,85 @@ def stream_download(
                     proc.returncode,
                     stderr_bytes.decode(errors="replace")[:500],
                 )
+
+    content_type = "video/mp4" if ext == "mp4" else f"video/{ext}"
+    return _iter(), filename, content_type
+
+
+def _download_via_tempfile(
+    *,
+    url: str,
+    selector: str,
+    safe_title: str,
+    platform: Platform,
+) -> tuple[Iterator[bytes], str, str]:
+    tmpdir = Path(tempfile.mkdtemp(prefix="snapreel_"))
+    output_template = tmpdir / "video.%(ext)s"
+
+    cmd: list[str] = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        *_BASE_YTDLP_FLAGS,
+        "--merge-output-format",
+        "mp4",
+    ]
+    cookiefile = _resolve_cookiefile(platform)
+    if cookiefile:
+        cmd.extend(["--cookies", cookiefile])
+    cmd.extend(["-f", selector, "-o", str(output_template), url])
+    logger.info(
+        "Spawning yt-dlp for tempfile download (platform=%s, cookies=%s, selector=%s)",
+        platform,
+        bool(cookiefile),
+        selector,
+    )
+
+    try:
+        result = subprocess.run(  # noqa: S603 - args are constructed safely above
+            cmd,
+            capture_output=True,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired as exc:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise DownloaderError(
+            "Download took too long. Try a smaller quality or another URL.",
+            status_code=504,
+        ) from exc
+
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="replace")
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        logger.warning("yt-dlp tempfile download failed: %s", stderr[:500])
+        raise DownloaderError(_friendly_error(stderr), status_code=400)
+
+    produced = sorted(
+        (p for p in tmpdir.iterdir() if p.is_file()),
+        key=lambda p: p.stat().st_size,
+        reverse=True,
+    )
+    if not produced:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise DownloaderError(
+            "No video file was produced.",
+            status_code=502,
+        )
+
+    produced_path = produced[0]
+    ext = produced_path.suffix.lstrip(".").lower() or "mp4"
+    filename = f"{safe_title}.{ext}"
+
+    def _iter() -> Iterator[bytes]:
+        try:
+            with produced_path.open("rb") as fh:
+                while True:
+                    chunk = fh.read(64 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     content_type = "video/mp4" if ext == "mp4" else f"video/{ext}"
     return _iter(), filename, content_type
