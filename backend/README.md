@@ -3,6 +3,7 @@ title: Reels Downloaders API
 sdk: docker
 app_port: 8000
 pinned: false
+license: mit
 short_description: yt-dlp-powered API for downloading short videos
 ---
 
