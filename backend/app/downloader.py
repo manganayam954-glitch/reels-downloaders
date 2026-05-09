@@ -13,10 +13,13 @@ which platforms are allowed live in :mod:`app.routes`.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -28,6 +31,49 @@ logger = logging.getLogger(__name__)
 
 
 SHORT_VIDEO_MAX_SECONDS = 600  # 10 minutes -- generous upper bound for "shorts"
+
+
+def _resolve_cookiefile(platform: Platform | None) -> str | None:
+    """Return a path to a Netscape-format cookies file for ``platform`` if one
+    has been provisioned via env vars, else ``None``.
+
+    Two ways to provide cookies (in order of priority):
+
+    1. ``{PLATFORM}_COOKIES_FILE`` env var pointing to a file path on disk.
+    2. ``{PLATFORM}_COOKIES`` env var containing the file *contents* directly
+       (useful on hosts like HF Spaces where you can only inject env vars,
+       not files). Contents are written to a per-platform tempfile on first
+       use.
+
+    Where ``{PLATFORM}`` is one of ``INSTAGRAM`` / ``FACEBOOK`` / ``TIKTOK`` /
+    ``YOUTUBE``. A platform-specific value wins over the generic ``COOKIES*``
+    fallback.
+    """
+
+    candidates: list[str] = []
+    if platform:
+        candidates.append(platform.upper())
+    candidates.append("")  # generic fallback (env vars without a prefix)
+
+    for prefix in candidates:
+        path_var = f"{prefix}_COOKIES_FILE" if prefix else "COOKIES_FILE"
+        body_var = f"{prefix}_COOKIES" if prefix else "COOKIES"
+
+        path = os.environ.get(path_var)
+        if path and Path(path).is_file():
+            return path
+
+        body = os.environ.get(body_var)
+        if body and body.strip():
+            cache_path = Path(tempfile.gettempdir()) / f"snapreel_{prefix.lower() or 'cookies'}.txt"
+            try:
+                cache_path.write_text(body, encoding="utf-8")
+            except OSError as exc:  # pragma: no cover - defensive
+                logger.warning("Failed to materialise cookies file %s: %s", cache_path, exc)
+                continue
+            return str(cache_path)
+
+    return None
 
 
 _PLATFORM_HOSTS: dict[Platform, tuple[str, ...]] = {
@@ -61,7 +107,11 @@ def detect_platform(url: str) -> Platform:
     return "other"
 
 
-def _ydl_opts(extra: dict[str, Any] | None = None) -> dict[str, Any]:
+def _ydl_opts(
+    extra: dict[str, Any] | None = None,
+    *,
+    platform: Platform | None = None,
+) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
@@ -88,7 +138,18 @@ def _ydl_opts(extra: dict[str, Any] | None = None) -> dict[str, Any]:
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
         },
+        # Some Meta extractors expose alternate APIs that work better in
+        # 2026 than the default web-page scraper.
+        "extractor_args": {
+            "instagram": {"api": ["graphql"]},
+        },
     }
+
+    cookiefile = _resolve_cookiefile(platform)
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
+        logger.info("Using cookies file %s for %s", cookiefile, platform or "any")
+
     if extra:
         opts.update(extra)
     return opts
@@ -224,7 +285,7 @@ def extract_info(url: str) -> VideoInfo:
 
     platform = detect_platform(url)
     try:
-        with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
+        with yt_dlp.YoutubeDL(_ydl_opts(platform=platform)) as ydl:
             raw = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as exc:
         msg = str(exc)
@@ -275,6 +336,8 @@ def stream_download(
             break
     filename = f"{safe_title}.{ext}"
 
+    platform = detect_platform(url)
+
     # Invoke via the current Python interpreter so we use the same yt-dlp
     # that the rest of the app imports -- no PATH lookups needed.
     cmd = [
@@ -295,13 +358,22 @@ def stream_download(
         "5",
         "--extractor-retries",
         "5",
-        "-f",
-        selector,
-        "-o",
-        "-",
-        url,
+        # Mirror `extractor_args` from `_ydl_opts` -- some Meta extractors
+        # have alternate APIs that work better in 2026.
+        "--extractor-args",
+        "instagram:api=graphql",
     ]
-    logger.info("Spawning yt-dlp for streaming")
+
+    cookiefile = _resolve_cookiefile(platform)
+    if cookiefile:
+        cmd.extend(["--cookies", cookiefile])
+
+    cmd.extend(["-f", selector, "-o", "-", url])
+    logger.info(
+        "Spawning yt-dlp for streaming (platform=%s, cookies=%s)",
+        platform,
+        bool(cookiefile),
+    )
 
     proc = subprocess.Popen(  # noqa: S603 - args are constructed safely above
         cmd,

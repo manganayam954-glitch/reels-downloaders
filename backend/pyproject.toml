@@ -9,7 +9,7 @@ readme = "README.md"
 python = "^3.12"
 fastapi = {extras = ["standard"], version = "^0.136.1"}
 psycopg = {extras = ["binary"], version = "^3.3.4"}
-yt-dlp = "^2024.0.0"
+yt-dlp = ">=2026.3.0,<2027"
 pydantic = "^2.0.0"
 
 
