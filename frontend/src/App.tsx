@@ -107,8 +107,18 @@ function App() {
   };
 
   return (
-    <div className="bg-app min-h-full">
-      <div className="mx-auto flex min-h-screen max-w-5xl flex-col px-4 pb-16 pt-6 sm:px-6 lg:px-8">
+    <div className="bg-app relative min-h-full overflow-hidden">
+      {/* Decorative "PALENG" watermark sitting behind the hero. Sits in
+          a fixed layer so it shows through the entire viewport without
+          pushing layout. aria-hidden so screen readers ignore it. */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-x-0 top-24 z-0 flex select-none justify-center sm:top-32"
+      >
+        <span className="paleng-watermark whitespace-nowrap">PALENG</span>
+      </div>
+
+      <div className="relative z-10 mx-auto flex min-h-screen max-w-5xl flex-col px-4 pb-16 pt-6 sm:px-6 lg:px-8">
         <header className="flex items-center justify-between">
           <a
             href="/"
