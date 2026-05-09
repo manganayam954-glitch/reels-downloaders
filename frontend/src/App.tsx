@@ -38,6 +38,12 @@ function App() {
   const [downloadedFormat, setDownloadedFormat] = useState<string | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>(() => loadHistory());
   const [toasts, setToasts] = useState<Toast[]>([]);
+  // Start "wanting" sound. The video element initially renders muted (because
+  // every browser blocks autoplay-with-sound on a cold page load), but on
+  // mount we *try* to play unmuted; if the browser allows it (high Media
+  // Engagement Index, persisted user gesture, etc.) sound starts instantly.
+  // Otherwise we fall back to muted autoplay and unmute the moment we see
+  // any sign of life from the user (mousemove / scroll / touch / key).
   const [bgMuted, setBgMuted] = useState(true);
   const bgVideoRef = useRef<HTMLVideoElement | null>(null);
 
@@ -47,35 +53,83 @@ function App() {
     saveHistory(history);
   }, [history]);
 
-  // Browsers block autoplay-with-sound until the user has interacted with
-  // the page. Start the bg video muted so it autoplays, then unmute it on
-  // the very first user gesture (click / keydown / touch). The button at
-  // bottom-right gives the user an explicit way to silence it again.
+  // 1) On mount, optimistically try to play with sound. If the browser
+  //    permits it (returning visitor, MEI, persisted permission, etc.)
+  //    audio kicks in on frame 1 with no interaction needed. If the
+  //    browser refuses, we silently fall back to the muted state we
+  //    already started in -- no error toast, this is expected.
   useEffect(() => {
-    if (!bgMuted) return; // already unmuted; nothing to do
+    const v = bgVideoRef.current;
+    if (!v) return;
+    let cancelled = false;
+    v.muted = false;
+    v.volume = 1;
+    v.play()
+      .then(() => {
+        if (!cancelled) setBgMuted(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // Browser blocked unmuted autoplay -- fall back to muted
+        // autoplay so the visuals still loop, then wait for any
+        // user gesture below to bring sound in.
+        v.muted = true;
+        setBgMuted(true);
+        v.play().catch(() => {
+          /* even muted autoplay can fail in extremely strict
+             configurations; non-fatal */
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // 2) While we're still muted, listen for ANY sign of user activity --
+  //    not just clicks. The instant we see one, unmute. This makes
+  //    sound feel "instant" on the user's first interaction with the
+  //    page, even just moving the mouse or starting to scroll.
+  useEffect(() => {
+    if (!bgMuted) return;
+    const events = [
+      "pointerdown",
+      "pointermove",
+      "keydown",
+      "touchstart",
+      "wheel",
+      "scroll",
+    ] as const;
     const unmute = () => {
       setBgMuted(false);
-      window.removeEventListener("pointerdown", unmute);
-      window.removeEventListener("keydown", unmute);
+      events.forEach((e) =>
+        window.removeEventListener(e, unmute, { capture: true } as never),
+      );
     };
-    window.addEventListener("pointerdown", unmute, { once: true });
-    window.addEventListener("keydown", unmute, { once: true });
+    events.forEach((e) =>
+      window.addEventListener(e, unmute, {
+        once: true,
+        capture: true,
+        passive: true,
+      } as AddEventListenerOptions),
+    );
     return () => {
-      window.removeEventListener("pointerdown", unmute);
-      window.removeEventListener("keydown", unmute);
+      events.forEach((e) =>
+        window.removeEventListener(e, unmute, { capture: true } as never),
+      );
     };
   }, [bgMuted]);
 
+  // 3) Whenever bgMuted flips, sync it onto the actual <video> element
+  //    and re-call play() (some user agents pause on a muted->unmuted
+  //    transition).
   useEffect(() => {
     const v = bgVideoRef.current;
     if (!v) return;
     v.muted = bgMuted;
-    if (!bgMuted) {
-      // Re-trigger play in case the browser paused on unmute
-      v.play().catch(() => {
-        /* user agents may still refuse; non-fatal */
-      });
-    }
+    v.play().catch(() => {
+      /* non-fatal; if the browser still refuses, the user can hit the
+         Sound on/off pill in the corner */
+    });
   }, [bgMuted]);
 
   const pushToast = (kind: Toast["kind"], message: string) => {
