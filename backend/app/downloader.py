@@ -67,6 +67,19 @@ def _ydl_opts(extra: dict[str, Any] | None = None) -> dict[str, Any]:
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+        # The HF Spaces / Render free tiers occasionally hit slow TLS
+        # handshakes against Instagram / YouTube edge nodes.  Give yt-dlp
+        # generous timeouts and a few retries so a transient first-attempt
+        # failure doesn't bubble up as a hard error.
+        "socket_timeout": 30,
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 5,
+        "retry_sleep_functions": {
+            "http": lambda n: min(2 ** n, 8),
+            "fragment": lambda n: min(2 ** n, 8),
+            "extractor": lambda n: min(2 ** n, 8),
+        },
         # Use a desktop UA -- some platforms block default yt-dlp UA on mobile pages.
         "http_headers": {
             "User-Agent": (
@@ -154,10 +167,22 @@ def _normalize_info(info: dict[str, Any], platform: Platform) -> VideoInfo:
 
 
 _FRIENDLY_ERROR_PATTERNS: tuple[tuple[str, str], ...] = (
+    # Instagram very frequently asks for cookies for "public" reels, and
+    # yt-dlp's exact error wording for that case is recognizable -- match
+    # it BEFORE the broader "login required" pattern so the message is
+    # specific and actionable.
+    (
+        r"rate-limit reached.*login required"
+        r"|requested content is not available"
+        r"|sign in to confirm",
+        "The platform is rate-limiting or asking us to sign in for this "
+        "video. Try again in a few minutes, or test with a TikTok or "
+        "Facebook link in the meantime.",
+    ),
     (
         r"login required|requires authentication|requires you to be logged in",
         "This video is private or requires you to be logged in. "
-        "SnapReel only supports public videos.",
+        "We only support public videos.",
     ),
     (
         r"video unavailable|not available|removed",
@@ -172,6 +197,16 @@ _FRIENDLY_ERROR_PATTERNS: tuple[tuple[str, str], ...] = (
     (
         r"http error 429|too many requests",
         "Rate-limited by the source. Wait a bit and try again.",
+    ),
+    # Cloud / shared-IP hosts (HF Spaces, Render free, etc.) sometimes
+    # get slow TLS handshakes against Instagram / YouTube edge nodes.
+    # Keep this pattern narrow so it doesn't swallow other errors.
+    (
+        r"handshake.*timed out|read timed out|connection timed out"
+        r"|tls handshake|ssl.*timed out",
+        "The source took too long to respond. This usually clears up in "
+        "a minute or two -- please try again. (Some platforms throttle "
+        "our deploy host's IP.)",
     ),
 )
 
@@ -249,6 +284,17 @@ def stream_download(
         "--no-playlist",
         "--quiet",
         "--no-warnings",
+        # Mirror the timeout / retry settings from `_ydl_opts` so the
+        # streaming path is just as resilient to flaky upstream TLS as
+        # the metadata path.
+        "--socket-timeout",
+        "30",
+        "--retries",
+        "5",
+        "--fragment-retries",
+        "5",
+        "--extractor-retries",
+        "5",
         "-f",
         selector,
         "-o",
