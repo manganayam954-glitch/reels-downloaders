@@ -99,12 +99,68 @@ Returns `{ "supported": ["facebook", "instagram", "tiktok", "youtube"] }`.
 
 ## Notes on each platform
 
-* **TikTok** and **Instagram Reels** — public videos work out of the box.
-* **Facebook** — public videos and `fb.watch` links are supported.
-* **YouTube** — Shorts work, but YouTube occasionally rate-limits server IPs.
-  If you hit a "Sign in to confirm you're not a bot" error, configure cookies
-  via `yt-dlp` (see the
-  [yt-dlp cookies wiki](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp)).
+* **TikTok** — public videos work out of the box, no cookies needed.
+* **Facebook** — public videos and `fb.watch` links work locally and from
+  most hosts. **However**, some shared-IP cloud hosts (notably the free
+  tier of Hugging Face Spaces) have their outbound IP ranges throttled by
+  Facebook's edge, which causes every request to time out at 30 s. If you
+  hit "The source took too long to respond" on every Facebook URL, the fix
+  is to deploy the backend somewhere with a different egress IP (Render,
+  Fly.io, your own VPS) — the code itself works.
+* **Instagram Reels** — public reels work, but Instagram aggressively rate-
+  limits anonymous traffic from datacenter IP ranges. If a reel that works
+  in a browser returns "rate-limit reached or login required", provision
+  a cookies file (see below). The downloader uses Instagram's GraphQL
+  endpoint by default, which is more reliable than the default web-page
+  scraper, but cookies are the only thing that fully unblocks IG today.
+* **YouTube** — Shorts work, but YouTube occasionally rate-limits server
+  IPs. If you hit a "Sign in to confirm you're not a bot" error, provision
+  cookies as below.
+
+### Optional: providing cookies for Instagram / Facebook / YouTube
+
+The backend reads cookies from environment variables, so you can wire them
+up on any host (HF Spaces, Render, Fly.io, Docker Compose, …) without
+committing the cookies to git. Two equivalent ways to provide a cookies
+file, in priority order:
+
+| Env var | Meaning |
+|---|---|
+| `INSTAGRAM_COOKIES_FILE` | Path on disk to a Netscape-format cookies file. |
+| `INSTAGRAM_COOKIES`      | The *contents* of that cookies file, as a single multi-line string. The backend writes it to a tempfile on first use. Easiest on hosts that only let you set env vars. |
+
+The same pattern works for `FACEBOOK_COOKIES{,_FILE}`, `YOUTUBE_COOKIES{,_FILE}`,
+and `TIKTOK_COOKIES{,_FILE}`. Generic `COOKIES{,_FILE}` is also honoured
+as a last-resort fallback for *all* platforms.
+
+To export cookies from your browser, use the
+[**Get cookies.txt LOCALLY**](https://chromewebstore.google.com/detail/cclelndahbckbenkjhflpdbgdldlbecc)
+Chrome extension (the "LOCALLY" suffix matters — the older extension is
+deprecated). Browse to instagram.com while logged in, click the extension,
+and click "Export". The downloaded `cookies.txt` is the value to use.
+
+Then either set:
+
+```bash
+# Hugging Face Space → Settings → Variables and secrets → New secret
+# Name:  INSTAGRAM_COOKIES
+# Value: <paste the entire body of cookies.txt>
+```
+
+…or mount the file at a known path and point at it:
+
+```bash
+# docker-compose / fly.toml
+INSTAGRAM_COOKIES_FILE=/data/instagram-cookies.txt
+```
+
+The backend will pass `--cookies <file>` to yt-dlp on every Instagram
+request. Same for Facebook / YouTube / TikTok if you set those env vars.
+
+> **Privacy note.** A cookies file is equivalent to your logged-in
+> session — anyone with that file can act as you on Instagram. Treat it
+> like a password. Use a throwaway account if you're going to host the
+> backend publicly.
 
 ## Deploying
 
