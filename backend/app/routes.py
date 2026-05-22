@@ -12,6 +12,7 @@ from app.downloader import (
     DownloaderError,
     detect_platform,
     extract_info,
+    normalize_url,
     stream_download,
 )
 from app.schemas import InfoRequest, VideoInfo
@@ -25,7 +26,7 @@ SUPPORTED_PLATFORMS = {"facebook", "tiktok", "instagram", "youtube"}
 
 
 def _ensure_supported(url: str) -> str:
-    platform = detect_platform(url)
+    platform = detect_platform(normalize_url(url))
     if platform == "other":
         raise HTTPException(
             status_code=400,

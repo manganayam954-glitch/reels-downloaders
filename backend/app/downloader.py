@@ -22,7 +22,7 @@ import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import yt_dlp
 
@@ -32,6 +32,20 @@ logger = logging.getLogger(__name__)
 
 
 SHORT_VIDEO_MAX_SECONDS = 600  # 10 minutes -- generous upper bound for "shorts"
+
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9,id;q=0.8"
+
+BEST_VIDEO_SELECTOR = (
+    "best[ext=mp4][vcodec!=none][acodec!=none]/"
+    "best[vcodec!=none][acodec!=none]/"
+    "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/best"
+)
 
 
 def _resolve_cookiefile(platform: Platform | None) -> str | None:
@@ -133,16 +147,14 @@ def _ydl_opts(
         },
         # Use a desktop UA -- some platforms block default yt-dlp UA on mobile pages.
         "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept-Language": DEFAULT_ACCEPT_LANGUAGE,
         },
         # Some Meta extractors expose alternate APIs that work better in
         # 2026 than the default web-page scraper.
         "extractor_args": {
             "instagram": {"api": ["graphql"]},
+            "youtube": {"player_client": ["android", "web"]},
         },
     }
 
@@ -206,7 +218,7 @@ def _normalize_info(info: dict[str, Any], platform: Platform) -> VideoInfo:
     if progressive:
         best_id: str | None = progressive[0].format_id
     else:
-        best_id = "bv*+ba/best"
+        best_id = BEST_VIDEO_SELECTOR
 
     duration = info.get("duration")
 
@@ -281,9 +293,29 @@ def _friendly_error(message: str) -> str:
     return "We couldn't fetch that video. Please verify the URL and try again."
 
 
+def normalize_url(url: str) -> str:
+    """Clean common mobile/share wrappers before handing the URL to yt-dlp."""
+
+    parsed = urlparse(url.strip())
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+
+    if host in {"l.facebook.com", "lm.facebook.com"}:
+        target = parse_qs(parsed.query).get("u", [None])[0]
+        if target:
+            return unquote(target)
+
+    if host == "youtube.com" and parsed.path == "/redirect":
+        target = parse_qs(parsed.query).get("q", [None])[0]
+        if target:
+            return unquote(target)
+
+    return url.strip()
+
+
 def extract_info(url: str) -> VideoInfo:
     """Extract a normalized :class:`VideoInfo` for the given URL."""
 
+    url = normalize_url(url)
     platform = detect_platform(url)
     try:
         with yt_dlp.YoutubeDL(_ydl_opts(platform=platform)) as ydl:
@@ -330,7 +362,11 @@ _BASE_YTDLP_FLAGS: tuple[str, ...] = (
     # Mirror `extractor_args` from `_ydl_opts` -- some Meta extractors
     # have alternate APIs that work better in 2026.
     "--extractor-args",
-    "instagram:api=graphql",
+    "instagram:api=graphql;youtube:player_client=android,web",
+    "--user-agent",
+    DEFAULT_USER_AGENT,
+    "--add-header",
+    f"Accept-Language:{DEFAULT_ACCEPT_LANGUAGE}",
 )
 
 
@@ -367,6 +403,7 @@ def stream_download(
     you cannot mux MP4 to a non-seekable stdout pipe.
     """
 
+    url = normalize_url(url)
     info = extract_info(url)
     selector = format_selector or info.best_format_id or "best"
 
