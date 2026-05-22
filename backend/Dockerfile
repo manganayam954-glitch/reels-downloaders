@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 # ffmpeg is needed by yt-dlp to mux some formats.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg curl ca-certificates \
+    && apt-get install -y --no-install-recommends ffmpeg curl ca-certificates nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 ENV POETRY_VERSION=1.8.3 \

@@ -12,6 +12,7 @@ which platforms are allowed live in :mod:`app.routes`.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -22,7 +23,7 @@ import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 import yt_dlp
@@ -157,6 +158,9 @@ def _ydl_opts(
             "instagram": {"api": ["graphql"]},
             "youtube": {"player_client": ["android", "web"]},
         },
+        # Enable yt-dlp's JS challenge solver when Node is available. YouTube
+        # direct media URLs often require solving the `n` parameter first.
+        "js_runtimes": {"node": {}},
     }
 
     cookiefile = _resolve_cookiefile(platform)
@@ -313,6 +317,164 @@ def normalize_url(url: str) -> str:
     return url.strip()
 
 
+
+
+
+def _solve_youtube_signature(signature: str, player_url: str | None, video_id: str) -> str | None:
+    if not player_url:
+        return None
+
+    try:
+        from yt_dlp.extractor.youtube._video import YoutubeIE
+        from yt_dlp.extractor.youtube.jsc.provider import (
+            JsChallengeRequest,
+            JsChallengeType,
+            SigChallengeInput,
+        )
+
+        with yt_dlp.YoutubeDL({"quiet": True, "js_runtimes": {"node": {}}}) as ydl:
+            ie = YoutubeIE(ydl)
+            ie._real_initialize()
+            request = JsChallengeRequest(
+                type=JsChallengeType.SIG,
+                video_id=video_id or "youtube",
+                input=SigChallengeInput(challenges=[signature], player_url=player_url),
+            )
+            for _, response in ie._jsc_director.bulk_solve([request]):
+                result = response.output.results.get(signature)
+                if result:
+                    return result
+    except Exception as exc:  # pragma: no cover - best-effort fallback
+        logger.warning("Failed to solve YouTube signature challenge: %s", exc)
+
+    return None
+
+def _solve_youtube_media_url(media_url: str, player_url: str | None, video_id: str) -> str:
+    if not player_url:
+        return media_url
+
+    parsed = urlparse(media_url)
+    query = parse_qs(parsed.query)
+    challenge = (query.get("n") or [None])[0]
+    if not challenge:
+        return media_url
+
+    try:
+        from yt_dlp.extractor.youtube._video import YoutubeIE
+        from yt_dlp.extractor.youtube.jsc.provider import (
+            JsChallengeRequest,
+            JsChallengeType,
+            NChallengeInput,
+        )
+
+        with yt_dlp.YoutubeDL({"quiet": True, "js_runtimes": {"node": {}}}) as ydl:
+            ie = YoutubeIE(ydl)
+            ie._real_initialize()
+            request = JsChallengeRequest(
+                type=JsChallengeType.N,
+                video_id=video_id or "youtube",
+                input=NChallengeInput(challenges=[challenge], player_url=player_url),
+            )
+            for _, response in ie._jsc_director.bulk_solve([request]):
+                result = response.output.results.get(challenge)
+                if result:
+                    query["n"] = [result]
+                    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+    except Exception as exc:  # pragma: no cover - best-effort fallback
+        logger.warning("Failed to solve YouTube media URL challenge: %s", exc)
+
+    return media_url
+
+def _extract_youtube_webpage_fallback(url: str) -> dict[str, Any] | None:
+    """Parse YouTube's initial player JSON when yt-dlp hits a bot check."""
+
+    request = Request(
+        url,
+        headers={
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept-Language": DEFAULT_ACCEPT_LANGUAGE,
+        },
+    )
+    try:
+        with urlopen(request, timeout=30) as response:  # noqa: S310 - user-supplied YouTube URL.
+            html = response.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+    player_url_match = re.search(r'"jsUrl":"([^"]+)"', html)
+    player_url = None
+    if player_url_match:
+        player_url = player_url_match.group(1)
+        if player_url.startswith("/"):
+            player_url = f"https://www.youtube.com{player_url}"
+
+    match = re.search(r"ytInitialPlayerResponse\s*=\s*(\{.+?\});", html)
+    if not match:
+        return None
+
+    try:
+        player = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+
+    if player.get("playabilityStatus", {}).get("status") != "OK":
+        return None
+
+    details = player.get("videoDetails") or {}
+    streaming = player.get("streamingData") or {}
+    raw_formats = [*(streaming.get("formats") or []), *(streaming.get("adaptiveFormats") or [])]
+    formats: list[dict[str, Any]] = []
+    for fmt in raw_formats:
+        media_url = fmt.get("url")
+        mime = str(fmt.get("mimeType") or "")
+        if not media_url and fmt.get("signatureCipher"):
+            cipher = parse_qs(str(fmt.get("signatureCipher")))
+            media_url = (cipher.get("url") or [None])[0]
+            signature = (cipher.get("s") or [None])[0]
+            signature_param = (cipher.get("sp") or ["signature"])[0]
+            if media_url and signature:
+                signature = _solve_youtube_signature(signature, player_url, str(details.get("videoId") or ""))
+                if signature:
+                    parsed_media = urlparse(media_url)
+                    media_query = parse_qs(parsed_media.query)
+                    media_query[signature_param] = [signature]
+                    media_url = urlunparse(parsed_media._replace(query=urlencode(media_query, doseq=True)))
+        if not media_url or not mime.startswith("video/"):
+            continue
+        media_url = _solve_youtube_media_url(media_url, player_url, str(details.get("videoId") or ""))
+        ext = "mp4" if "mp4" in mime else "webm"
+        has_audio = bool(fmt.get("audioQuality") or fmt.get("audioSampleRate"))
+        formats.append(
+            {
+                "format_id": str(fmt.get("itag") or len(formats)),
+                "url": media_url,
+                "ext": ext,
+                "vcodec": "unknown",
+                "acodec": "unknown" if has_audio else "none",
+                "width": fmt.get("width"),
+                "height": fmt.get("height"),
+                "fps": fmt.get("fps"),
+                "filesize": int(fmt["contentLength"]) if str(fmt.get("contentLength") or "").isdigit() else None,
+                "format_note": fmt.get("qualityLabel") or fmt.get("quality"),
+                "tbr": fmt.get("bitrate"),
+            }
+        )
+
+    if not formats:
+        return None
+
+    return {
+        "id": details.get("videoId") or url.rsplit("/", 1)[-1],
+        "title": details.get("title") or "YouTube Shorts video",
+        "description": details.get("shortDescription"),
+        "uploader": details.get("author"),
+        "duration": float(details["lengthSeconds"]) if str(details.get("lengthSeconds") or "").isdigit() else None,
+        "thumbnail": ((details.get("thumbnail") or {}).get("thumbnails") or [{}])[-1].get("url"),
+        "webpage_url": url,
+        "formats": formats,
+        "view_count": int(details["viewCount"]) if str(details.get("viewCount") or "").isdigit() else None,
+    }
+
 def _extract_raw(url: str) -> tuple[dict[str, Any], Platform]:
     """Extract raw yt-dlp metadata once and normalize playlist/carousel results."""
 
@@ -323,6 +485,10 @@ def _extract_raw(url: str) -> tuple[dict[str, Any], Platform]:
             raw = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as exc:
         msg = str(exc)
+        if platform == "youtube" and "confirm" in msg.lower() and "bot" in msg.lower():
+            fallback = _extract_youtube_webpage_fallback(url)
+            if fallback is not None:
+                return fallback, platform
         logger.warning("yt-dlp DownloadError for %s: %s", url, msg)
         raise DownloaderError(_friendly_error(msg), status_code=400) from exc
     except Exception as exc:  # pragma: no cover - defensive
@@ -371,6 +537,8 @@ _BASE_YTDLP_FLAGS: tuple[str, ...] = (
     # have alternate APIs that work better in 2026.
     "--extractor-args",
     "instagram:api=graphql;youtube:player_client=android,web",
+    "--js-runtimes",
+    "node",
     "--user-agent",
     DEFAULT_USER_AGENT,
     "--add-header",
