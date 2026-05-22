@@ -23,6 +23,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
+from urllib.request import Request, urlopen
 
 import yt_dlp
 
@@ -312,8 +313,8 @@ def normalize_url(url: str) -> str:
     return url.strip()
 
 
-def extract_info(url: str) -> VideoInfo:
-    """Extract a normalized :class:`VideoInfo` for the given URL."""
+def _extract_raw(url: str) -> tuple[dict[str, Any], Platform]:
+    """Extract raw yt-dlp metadata once and normalize playlist/carousel results."""
 
     url = normalize_url(url)
     platform = detect_platform(url)
@@ -341,6 +342,13 @@ def extract_info(url: str) -> VideoInfo:
             raise DownloaderError("This URL has no playable videos.", status_code=400)
         raw = entries[0]
 
+    return raw, platform
+
+
+def extract_info(url: str) -> VideoInfo:
+    """Extract a normalized :class:`VideoInfo` for the given URL."""
+
+    raw, platform = _extract_raw(url)
     return _normalize_info(raw, platform)
 
 
@@ -404,11 +412,15 @@ def stream_download(
     """
 
     url = normalize_url(url)
-    info = extract_info(url)
+    raw, platform = _extract_raw(url)
+    info = _normalize_info(raw, platform)
     selector = format_selector or info.best_format_id or "best"
 
     safe_title = re.sub(r"[^\w\-. ]+", "_", info.title).strip("._ ") or "video"
-    platform = detect_platform(url)
+
+    direct = _find_direct_format(raw, selector)
+    if direct is not None:
+        return _stream_direct_url(direct=direct, safe_title=safe_title)
 
     if _selector_needs_merging(selector):
         return _download_via_tempfile(
@@ -425,6 +437,43 @@ def stream_download(
         info=info,
     )
 
+
+
+def _find_direct_format(raw: dict[str, Any], selector: str) -> dict[str, Any] | None:
+    formats = [fmt for fmt in raw.get("formats") or [] if fmt.get("url") and (fmt.get("vcodec") or "none") != "none"]
+    if not formats and raw.get("url"):
+        return raw
+
+    for fmt in formats:
+        if str(fmt.get("format_id")) == selector:
+            return fmt
+
+    progressive = [fmt for fmt in formats if (fmt.get("acodec") or "none") != "none"]
+    candidates = progressive or formats
+    if selector == BEST_VIDEO_SELECTOR and candidates:
+        return max(candidates, key=lambda fmt: (fmt.get("height") or 0, fmt.get("tbr") or 0))
+    return None
+
+
+def _stream_direct_url(*, direct: dict[str, Any], safe_title: str) -> tuple[Iterator[bytes], str, str]:
+    ext = str(direct.get("ext") or "mp4")
+    filename = f"{safe_title}.{ext}"
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept-Language": DEFAULT_ACCEPT_LANGUAGE,
+    }
+
+    def _iter() -> Iterator[bytes]:
+        request = Request(str(direct["url"]), headers=headers)
+        with urlopen(request, timeout=60) as response:  # noqa: S310 - yt-dlp returns trusted media URLs.
+            while True:
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+
+    content_type = "video/mp4" if ext == "mp4" else f"video/{ext}"
+    return _iter(), filename, content_type
 
 def _stream_stdout(
     *,
