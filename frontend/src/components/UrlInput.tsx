@@ -129,7 +129,7 @@ export function UrlInput({
               </>
             ) : (
               <>
-                Get video
+                NDAS BANDENG
                 <ArrowRight className="h-4 w-4" />
               </>
             )}

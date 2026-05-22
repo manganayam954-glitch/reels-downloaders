@@ -1,5 +1,13 @@
-import { CheckCircle2, Github, Sparkles, Wand2, X } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import {
+  CheckCircle2,
+  Github,
+  Sparkles,
+  Volume2,
+  VolumeX,
+  Wand2,
+  X,
+} from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { HistoryPanel, type HistoryItem } from "@/components/HistoryPanel";
 import { SupportedPlatforms } from "@/components/SupportedPlatforms";
@@ -30,12 +38,99 @@ function App() {
   const [downloadedFormat, setDownloadedFormat] = useState<string | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>(() => loadHistory());
   const [toasts, setToasts] = useState<Toast[]>([]);
+  // Start "wanting" sound. The video element initially renders muted (because
+  // every browser blocks autoplay-with-sound on a cold page load), but on
+  // mount we *try* to play unmuted; if the browser allows it (high Media
+  // Engagement Index, persisted user gesture, etc.) sound starts instantly.
+  // Otherwise we fall back to muted autoplay and unmute the moment we see
+  // any sign of life from the user (mousemove / scroll / touch / key).
+  const [bgMuted, setBgMuted] = useState(true);
+  const bgVideoRef = useRef<HTMLVideoElement | null>(null);
 
   const detectedPlatform = useMemo(() => detectPlatform(url), [url]);
 
   useEffect(() => {
     saveHistory(history);
   }, [history]);
+
+  // 1) On mount, optimistically try to play with sound. If the browser
+  //    permits it (returning visitor, MEI, persisted permission, etc.)
+  //    audio kicks in on frame 1 with no interaction needed. If the
+  //    browser refuses, we silently fall back to the muted state we
+  //    already started in -- no error toast, this is expected.
+  useEffect(() => {
+    const v = bgVideoRef.current;
+    if (!v) return;
+    let cancelled = false;
+    v.muted = false;
+    v.volume = 1;
+    v.play()
+      .then(() => {
+        if (!cancelled) setBgMuted(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // Browser blocked unmuted autoplay -- fall back to muted
+        // autoplay so the visuals still loop, then wait for any
+        // user gesture below to bring sound in.
+        v.muted = true;
+        setBgMuted(true);
+        v.play().catch(() => {
+          /* even muted autoplay can fail in extremely strict
+             configurations; non-fatal */
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // 2) While we're still muted, listen for ANY sign of user activity --
+  //    not just clicks. The instant we see one, unmute. This makes
+  //    sound feel "instant" on the user's first interaction with the
+  //    page, even just moving the mouse or starting to scroll.
+  useEffect(() => {
+    if (!bgMuted) return;
+    const events = [
+      "pointerdown",
+      "pointermove",
+      "keydown",
+      "touchstart",
+      "wheel",
+      "scroll",
+    ] as const;
+    const unmute = () => {
+      setBgMuted(false);
+      events.forEach((e) =>
+        window.removeEventListener(e, unmute, { capture: true } as never),
+      );
+    };
+    events.forEach((e) =>
+      window.addEventListener(e, unmute, {
+        once: true,
+        capture: true,
+        passive: true,
+      } as AddEventListenerOptions),
+    );
+    return () => {
+      events.forEach((e) =>
+        window.removeEventListener(e, unmute, { capture: true } as never),
+      );
+    };
+  }, [bgMuted]);
+
+  // 3) Whenever bgMuted flips, sync it onto the actual <video> element
+  //    and re-call play() (some user agents pause on a muted->unmuted
+  //    transition).
+  useEffect(() => {
+    const v = bgVideoRef.current;
+    if (!v) return;
+    v.muted = bgMuted;
+    v.play().catch(() => {
+      /* non-fatal; if the browser still refuses, the user can hit the
+         Sound on/off pill in the corner */
+    });
+  }, [bgMuted]);
 
   const pushToast = (kind: Toast["kind"], message: string) => {
     const id = Date.now() + Math.random();
@@ -107,8 +202,29 @@ function App() {
   };
 
   return (
-    <div className="bg-app min-h-full">
-      <div className="mx-auto flex min-h-screen max-w-5xl flex-col px-4 pb-16 pt-6 sm:px-6 lg:px-8">
+    <div className="bg-app relative min-h-full overflow-hidden">
+      {/* Decorative looping background video sitting behind the hero -- low
+          opacity so the foreground stays readable, but you can still see
+          and hear what's playing. aria-hidden so screen readers ignore it. */}
+      <video
+        ref={bgVideoRef}
+        className="video-watermark pointer-events-none absolute inset-0 z-0 h-full w-full object-cover"
+        src="/hero-watermark.mp4"
+        autoPlay
+        loop
+        muted={bgMuted}
+        playsInline
+        preload="auto"
+        aria-hidden="true"
+      />
+      {/* Soft gradient veil so the hero copy keeps strong contrast on top of
+          the moving video. */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-0 z-0 bg-gradient-to-b from-[hsl(var(--background))]/50 via-[hsl(var(--background))]/30 to-[hsl(var(--background))]/85"
+      />
+
+      <div className="relative z-10 mx-auto flex min-h-screen max-w-5xl flex-col px-4 pb-16 pt-6 sm:px-6 lg:px-8">
         <header className="flex items-center justify-between">
           <a
             href="/"
@@ -118,7 +234,7 @@ function App() {
               <Wand2 className="h-4 w-4" />
             </span>
             <span className="text-base font-bold tracking-tight text-white">
-              Reels<span className="text-gradient">Grab</span>
+              <span className="text-gradient">BAYONG</span>
             </span>
           </a>
           <a
@@ -206,6 +322,27 @@ function App() {
           law.
         </footer>
       </div>
+
+      {/* Background-video sound toggle. Sits above content but doesn't
+          steal focus from the URL input. Starts in 'muted' state because
+          browsers refuse to autoplay with sound; flips to 'on' on the
+          first user interaction with the page (or when the user clicks
+          this button). */}
+      <button
+        type="button"
+        onClick={() => setBgMuted((m) => !m)}
+        aria-label={
+          bgMuted ? "Enable background video sound" : "Mute background video"
+        }
+        className="fixed bottom-4 right-4 z-40 inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.06] px-3 py-1.5 text-xs font-medium text-white/70 backdrop-blur-md transition hover:border-white/20 hover:text-white"
+      >
+        {bgMuted ? (
+          <VolumeX className="h-3.5 w-3.5" />
+        ) : (
+          <Volume2 className="h-3.5 w-3.5" />
+        )}
+        {bgMuted ? "Sound off" : "Sound on"}
+      </button>
 
       {/* Toasts */}
       <div className="pointer-events-none fixed inset-x-0 bottom-4 z-50 flex flex-col items-center gap-2 px-4">

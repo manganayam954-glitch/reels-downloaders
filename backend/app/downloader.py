@@ -12,13 +12,19 @@ which platforms are allowed live in :mod:`app.routes`.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
+from urllib.request import Request, urlopen
 
 import yt_dlp
 
@@ -28,6 +34,63 @@ logger = logging.getLogger(__name__)
 
 
 SHORT_VIDEO_MAX_SECONDS = 600  # 10 minutes -- generous upper bound for "shorts"
+
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9,id;q=0.8"
+
+BEST_VIDEO_SELECTOR = (
+    "best[ext=mp4][vcodec!=none][acodec!=none]/"
+    "best[vcodec!=none][acodec!=none]/"
+    "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/best"
+)
+
+
+def _resolve_cookiefile(platform: Platform | None) -> str | None:
+    """Return a path to a Netscape-format cookies file for ``platform`` if one
+    has been provisioned via env vars, else ``None``.
+
+    Two ways to provide cookies (in order of priority):
+
+    1. ``{PLATFORM}_COOKIES_FILE`` env var pointing to a file path on disk.
+    2. ``{PLATFORM}_COOKIES`` env var containing the file *contents* directly
+       (useful on hosts like HF Spaces where you can only inject env vars,
+       not files). Contents are written to a per-platform tempfile on first
+       use.
+
+    Where ``{PLATFORM}`` is one of ``INSTAGRAM`` / ``FACEBOOK`` / ``TIKTOK`` /
+    ``YOUTUBE``. A platform-specific value wins over the generic ``COOKIES*``
+    fallback.
+    """
+
+    candidates: list[str] = []
+    if platform:
+        candidates.append(platform.upper())
+    candidates.append("")  # generic fallback (env vars without a prefix)
+
+    for prefix in candidates:
+        path_var = f"{prefix}_COOKIES_FILE" if prefix else "COOKIES_FILE"
+        body_var = f"{prefix}_COOKIES" if prefix else "COOKIES"
+
+        path = os.environ.get(path_var)
+        if path and Path(path).is_file():
+            return path
+
+        body = os.environ.get(body_var)
+        if body and body.strip():
+            cache_path = Path(tempfile.gettempdir()) / f"snapreel_{prefix.lower() or 'cookies'}.txt"
+            try:
+                cache_path.write_text(body, encoding="utf-8")
+            except OSError as exc:  # pragma: no cover - defensive
+                logger.warning("Failed to materialise cookies file %s: %s", cache_path, exc)
+                continue
+            return str(cache_path)
+
+    return None
 
 
 _PLATFORM_HOSTS: dict[Platform, tuple[str, ...]] = {
@@ -61,21 +124,50 @@ def detect_platform(url: str) -> Platform:
     return "other"
 
 
-def _ydl_opts(extra: dict[str, Any] | None = None) -> dict[str, Any]:
+def _ydl_opts(
+    extra: dict[str, Any] | None = None,
+    *,
+    platform: Platform | None = None,
+) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+        # The HF Spaces / Render free tiers occasionally hit slow TLS
+        # handshakes against Instagram / YouTube edge nodes.  Give yt-dlp
+        # generous timeouts and a few retries so a transient first-attempt
+        # failure doesn't bubble up as a hard error.
+        "socket_timeout": 30,
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 5,
+        "retry_sleep_functions": {
+            "http": lambda n: min(2 ** n, 8),
+            "fragment": lambda n: min(2 ** n, 8),
+            "extractor": lambda n: min(2 ** n, 8),
+        },
         # Use a desktop UA -- some platforms block default yt-dlp UA on mobile pages.
         "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept-Language": DEFAULT_ACCEPT_LANGUAGE,
         },
+        # Some Meta extractors expose alternate APIs that work better in
+        # 2026 than the default web-page scraper.
+        "extractor_args": {
+            "instagram": {"api": ["graphql"]},
+            "youtube": {"player_client": ["android", "web"]},
+        },
+        # Enable yt-dlp's JS challenge solver when Node is available. YouTube
+        # direct media URLs often require solving the `n` parameter first.
+        "js_runtimes": {"node": {}},
     }
+
+    cookiefile = _resolve_cookiefile(platform)
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
+        logger.info("Using cookies file %s for %s", cookiefile, platform or "any")
+
     if extra:
         opts.update(extra)
     return opts
@@ -131,7 +223,7 @@ def _normalize_info(info: dict[str, Any], platform: Platform) -> VideoInfo:
     if progressive:
         best_id: str | None = progressive[0].format_id
     else:
-        best_id = "bv*+ba/best"
+        best_id = BEST_VIDEO_SELECTOR
 
     duration = info.get("duration")
 
@@ -154,10 +246,22 @@ def _normalize_info(info: dict[str, Any], platform: Platform) -> VideoInfo:
 
 
 _FRIENDLY_ERROR_PATTERNS: tuple[tuple[str, str], ...] = (
+    # Instagram very frequently asks for cookies for "public" reels, and
+    # yt-dlp's exact error wording for that case is recognizable -- match
+    # it BEFORE the broader "login required" pattern so the message is
+    # specific and actionable.
+    (
+        r"rate-limit reached.*login required"
+        r"|requested content is not available"
+        r"|sign in to confirm",
+        "The platform is rate-limiting or asking us to sign in for this "
+        "video. Try again in a few minutes, or test with a TikTok or "
+        "Facebook link in the meantime.",
+    ),
     (
         r"login required|requires authentication|requires you to be logged in",
         "This video is private or requires you to be logged in. "
-        "SnapReel only supports public videos.",
+        "We only support public videos.",
     ),
     (
         r"video unavailable|not available|removed",
@@ -173,6 +277,16 @@ _FRIENDLY_ERROR_PATTERNS: tuple[tuple[str, str], ...] = (
         r"http error 429|too many requests",
         "Rate-limited by the source. Wait a bit and try again.",
     ),
+    # Cloud / shared-IP hosts (HF Spaces, Render free, etc.) sometimes
+    # get slow TLS handshakes against Instagram / YouTube edge nodes.
+    # Keep this pattern narrow so it doesn't swallow other errors.
+    (
+        r"handshake.*timed out|read timed out|connection timed out"
+        r"|tls handshake|ssl.*timed out",
+        "The source took too long to respond. This usually clears up in "
+        "a minute or two -- please try again. (Some platforms throttle "
+        "our deploy host's IP.)",
+    ),
 )
 
 
@@ -184,15 +298,197 @@ def _friendly_error(message: str) -> str:
     return "We couldn't fetch that video. Please verify the URL and try again."
 
 
-def extract_info(url: str) -> VideoInfo:
-    """Extract a normalized :class:`VideoInfo` for the given URL."""
+def normalize_url(url: str) -> str:
+    """Clean common mobile/share wrappers before handing the URL to yt-dlp."""
 
+    parsed = urlparse(url.strip())
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+
+    if host in {"l.facebook.com", "lm.facebook.com"}:
+        target = parse_qs(parsed.query).get("u", [None])[0]
+        if target:
+            return unquote(target)
+
+    if host == "youtube.com" and parsed.path == "/redirect":
+        target = parse_qs(parsed.query).get("q", [None])[0]
+        if target:
+            return unquote(target)
+
+    return url.strip()
+
+
+
+
+
+def _solve_youtube_signature(signature: str, player_url: str | None, video_id: str) -> str | None:
+    if not player_url:
+        return None
+
+    try:
+        from yt_dlp.extractor.youtube._video import YoutubeIE
+        from yt_dlp.extractor.youtube.jsc.provider import (
+            JsChallengeRequest,
+            JsChallengeType,
+            SigChallengeInput,
+        )
+
+        with yt_dlp.YoutubeDL({"quiet": True, "js_runtimes": {"node": {}}}) as ydl:
+            ie = YoutubeIE(ydl)
+            ie._real_initialize()
+            request = JsChallengeRequest(
+                type=JsChallengeType.SIG,
+                video_id=video_id or "youtube",
+                input=SigChallengeInput(challenges=[signature], player_url=player_url),
+            )
+            for _, response in ie._jsc_director.bulk_solve([request]):
+                result = response.output.results.get(signature)
+                if result:
+                    return result
+    except Exception as exc:  # pragma: no cover - best-effort fallback
+        logger.warning("Failed to solve YouTube signature challenge: %s", exc)
+
+    return None
+
+def _solve_youtube_media_url(media_url: str, player_url: str | None, video_id: str) -> str:
+    if not player_url:
+        return media_url
+
+    parsed = urlparse(media_url)
+    query = parse_qs(parsed.query)
+    challenge = (query.get("n") or [None])[0]
+    if not challenge:
+        return media_url
+
+    try:
+        from yt_dlp.extractor.youtube._video import YoutubeIE
+        from yt_dlp.extractor.youtube.jsc.provider import (
+            JsChallengeRequest,
+            JsChallengeType,
+            NChallengeInput,
+        )
+
+        with yt_dlp.YoutubeDL({"quiet": True, "js_runtimes": {"node": {}}}) as ydl:
+            ie = YoutubeIE(ydl)
+            ie._real_initialize()
+            request = JsChallengeRequest(
+                type=JsChallengeType.N,
+                video_id=video_id or "youtube",
+                input=NChallengeInput(challenges=[challenge], player_url=player_url),
+            )
+            for _, response in ie._jsc_director.bulk_solve([request]):
+                result = response.output.results.get(challenge)
+                if result:
+                    query["n"] = [result]
+                    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+    except Exception as exc:  # pragma: no cover - best-effort fallback
+        logger.warning("Failed to solve YouTube media URL challenge: %s", exc)
+
+    return media_url
+
+def _extract_youtube_webpage_fallback(url: str) -> dict[str, Any] | None:
+    """Parse YouTube's initial player JSON when yt-dlp hits a bot check."""
+
+    request = Request(
+        url,
+        headers={
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept-Language": DEFAULT_ACCEPT_LANGUAGE,
+        },
+    )
+    try:
+        with urlopen(request, timeout=30) as response:  # noqa: S310 - user-supplied YouTube URL.
+            html = response.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+    player_url_match = re.search(r'"jsUrl":"([^"]+)"', html)
+    player_url = None
+    if player_url_match:
+        player_url = player_url_match.group(1)
+        if player_url.startswith("/"):
+            player_url = f"https://www.youtube.com{player_url}"
+
+    match = re.search(r"ytInitialPlayerResponse\s*=\s*(\{.+?\});", html)
+    if not match:
+        return None
+
+    try:
+        player = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+
+    if player.get("playabilityStatus", {}).get("status") != "OK":
+        return None
+
+    details = player.get("videoDetails") or {}
+    streaming = player.get("streamingData") or {}
+    raw_formats = [*(streaming.get("formats") or []), *(streaming.get("adaptiveFormats") or [])]
+    formats: list[dict[str, Any]] = []
+    for fmt in raw_formats:
+        media_url = fmt.get("url")
+        mime = str(fmt.get("mimeType") or "")
+        if not media_url and fmt.get("signatureCipher"):
+            cipher = parse_qs(str(fmt.get("signatureCipher")))
+            media_url = (cipher.get("url") or [None])[0]
+            signature = (cipher.get("s") or [None])[0]
+            signature_param = (cipher.get("sp") or ["signature"])[0]
+            if media_url and signature:
+                signature = _solve_youtube_signature(signature, player_url, str(details.get("videoId") or ""))
+                if signature:
+                    parsed_media = urlparse(media_url)
+                    media_query = parse_qs(parsed_media.query)
+                    media_query[signature_param] = [signature]
+                    media_url = urlunparse(parsed_media._replace(query=urlencode(media_query, doseq=True)))
+        if not media_url or not mime.startswith("video/"):
+            continue
+        media_url = _solve_youtube_media_url(media_url, player_url, str(details.get("videoId") or ""))
+        ext = "mp4" if "mp4" in mime else "webm"
+        has_audio = bool(fmt.get("audioQuality") or fmt.get("audioSampleRate"))
+        formats.append(
+            {
+                "format_id": str(fmt.get("itag") or len(formats)),
+                "url": media_url,
+                "ext": ext,
+                "vcodec": "unknown",
+                "acodec": "unknown" if has_audio else "none",
+                "width": fmt.get("width"),
+                "height": fmt.get("height"),
+                "fps": fmt.get("fps"),
+                "filesize": int(fmt["contentLength"]) if str(fmt.get("contentLength") or "").isdigit() else None,
+                "format_note": fmt.get("qualityLabel") or fmt.get("quality"),
+                "tbr": fmt.get("bitrate"),
+            }
+        )
+
+    if not formats:
+        return None
+
+    return {
+        "id": details.get("videoId") or url.rsplit("/", 1)[-1],
+        "title": details.get("title") or "YouTube Shorts video",
+        "description": details.get("shortDescription"),
+        "uploader": details.get("author"),
+        "duration": float(details["lengthSeconds"]) if str(details.get("lengthSeconds") or "").isdigit() else None,
+        "thumbnail": ((details.get("thumbnail") or {}).get("thumbnails") or [{}])[-1].get("url"),
+        "webpage_url": url,
+        "formats": formats,
+        "view_count": int(details["viewCount"]) if str(details.get("viewCount") or "").isdigit() else None,
+    }
+
+def _extract_raw(url: str) -> tuple[dict[str, Any], Platform]:
+    """Extract raw yt-dlp metadata once and normalize playlist/carousel results."""
+
+    url = normalize_url(url)
     platform = detect_platform(url)
     try:
-        with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
+        with yt_dlp.YoutubeDL(_ydl_opts(platform=platform)) as ydl:
             raw = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as exc:
         msg = str(exc)
+        if platform == "youtube" and "confirm" in msg.lower() and "bot" in msg.lower():
+            fallback = _extract_youtube_webpage_fallback(url)
+            if fallback is not None:
+                return fallback, platform
         logger.warning("yt-dlp DownloadError for %s: %s", url, msg)
         raise DownloaderError(_friendly_error(msg), status_code=400) from exc
     except Exception as exc:  # pragma: no cover - defensive
@@ -212,7 +508,56 @@ def extract_info(url: str) -> VideoInfo:
             raise DownloaderError("This URL has no playable videos.", status_code=400)
         raw = entries[0]
 
+    return raw, platform
+
+
+def extract_info(url: str) -> VideoInfo:
+    """Extract a normalized :class:`VideoInfo` for the given URL."""
+
+    raw, platform = _extract_raw(url)
     return _normalize_info(raw, platform)
+
+
+_BASE_YTDLP_FLAGS: tuple[str, ...] = (
+    "--no-playlist",
+    "--quiet",
+    "--no-warnings",
+    # Mirror the timeout / retry settings from `_ydl_opts` so the
+    # streaming path is just as resilient to flaky upstream TLS as
+    # the metadata path.
+    "--socket-timeout",
+    "30",
+    "--retries",
+    "5",
+    "--fragment-retries",
+    "5",
+    "--extractor-retries",
+    "5",
+    # Mirror `extractor_args` from `_ydl_opts` -- some Meta extractors
+    # have alternate APIs that work better in 2026.
+    "--extractor-args",
+    "instagram:api=graphql;youtube:player_client=android,web",
+    "--js-runtimes",
+    "node",
+    "--user-agent",
+    DEFAULT_USER_AGENT,
+    "--add-header",
+    f"Accept-Language:{DEFAULT_ACCEPT_LANGUAGE}",
+)
+
+
+def _selector_needs_merging(selector: str) -> bool:
+    """Return True if a yt-dlp format selector requires merging two streams.
+
+    yt-dlp can stream a single muxed format directly to stdout, but a
+    selector like ``bv*+ba`` or ``137+140`` produces two separate streams
+    that must be muxed via ffmpeg into a real MP4 -- and MP4 muxing needs a
+    seekable output (the ``moov`` atom must be patched in at the end), so we
+    can't pipe to stdout.  In that case we download to a tempfile and stream
+    that back instead.
+    """
+
+    return "+" in selector or "bv" in selector or "ba" in selector
 
 
 def stream_download(
@@ -224,15 +569,88 @@ def stream_download(
 
     Returns ``(byte_iterator, suggested_filename, content_type)``.
 
-    Implementation note: we shell out to ``yt-dlp -o -`` so it can write the
-    muxed result to stdout without us having to manage a temp file.  This is
-    the same approach the official docs recommend for streaming.
+    For *progressive* formats (audio + video already muxed by the platform,
+    common on TikTok / Facebook), we shell out to ``yt-dlp -o -`` so the
+    bytes flow through stdout with zero filesystem footprint.
+
+    For *DASH* formats (audio + video as separate streams, common on
+    Instagram / YouTube), we download to a tempfile, ask yt-dlp to remux
+    into MP4, and then stream the tempfile back to the client -- because
+    you cannot mux MP4 to a non-seekable stdout pipe.
     """
 
-    info = extract_info(url)
+    url = normalize_url(url)
+    raw, platform = _extract_raw(url)
+    info = _normalize_info(raw, platform)
     selector = format_selector or info.best_format_id or "best"
 
     safe_title = re.sub(r"[^\w\-. ]+", "_", info.title).strip("._ ") or "video"
+
+    direct = _find_direct_format(raw, selector)
+    if direct is not None:
+        return _stream_direct_url(direct=direct, safe_title=safe_title)
+
+    if _selector_needs_merging(selector):
+        return _download_via_tempfile(
+            url=url,
+            selector=selector,
+            safe_title=safe_title,
+            platform=platform,
+        )
+    return _stream_stdout(
+        url=url,
+        selector=selector,
+        safe_title=safe_title,
+        platform=platform,
+        info=info,
+    )
+
+
+
+def _find_direct_format(raw: dict[str, Any], selector: str) -> dict[str, Any] | None:
+    formats = [fmt for fmt in raw.get("formats") or [] if fmt.get("url") and (fmt.get("vcodec") or "none") != "none"]
+    if not formats and raw.get("url"):
+        return raw
+
+    for fmt in formats:
+        if str(fmt.get("format_id")) == selector:
+            return fmt
+
+    progressive = [fmt for fmt in formats if (fmt.get("acodec") or "none") != "none"]
+    candidates = progressive or formats
+    if selector == BEST_VIDEO_SELECTOR and candidates:
+        return max(candidates, key=lambda fmt: (fmt.get("height") or 0, fmt.get("tbr") or 0))
+    return None
+
+
+def _stream_direct_url(*, direct: dict[str, Any], safe_title: str) -> tuple[Iterator[bytes], str, str]:
+    ext = str(direct.get("ext") or "mp4")
+    filename = f"{safe_title}.{ext}"
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept-Language": DEFAULT_ACCEPT_LANGUAGE,
+    }
+
+    def _iter() -> Iterator[bytes]:
+        request = Request(str(direct["url"]), headers=headers)
+        with urlopen(request, timeout=60) as response:  # noqa: S310 - yt-dlp returns trusted media URLs.
+            while True:
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+
+    content_type = "video/mp4" if ext == "mp4" else f"video/{ext}"
+    return _iter(), filename, content_type
+
+def _stream_stdout(
+    *,
+    url: str,
+    selector: str,
+    safe_title: str,
+    platform: Platform,
+    info: VideoInfo,
+) -> tuple[Iterator[bytes], str, str]:
     ext = "mp4"
     for fmt in info.formats:
         if fmt.format_id == selector and fmt.ext:
@@ -240,22 +658,17 @@ def stream_download(
             break
     filename = f"{safe_title}.{ext}"
 
-    # Invoke via the current Python interpreter so we use the same yt-dlp
-    # that the rest of the app imports -- no PATH lookups needed.
-    cmd = [
-        sys.executable,
-        "-m",
-        "yt_dlp",
-        "--no-playlist",
-        "--quiet",
-        "--no-warnings",
-        "-f",
+    cmd: list[str] = [sys.executable, "-m", "yt_dlp", *_BASE_YTDLP_FLAGS]
+    cookiefile = _resolve_cookiefile(platform)
+    if cookiefile:
+        cmd.extend(["--cookies", cookiefile])
+    cmd.extend(["-f", selector, "-o", "-", url])
+    logger.info(
+        "Spawning yt-dlp for stdout streaming (platform=%s, cookies=%s, selector=%s)",
+        platform,
+        bool(cookiefile),
         selector,
-        "-o",
-        "-",
-        url,
-    ]
-    logger.info("Spawning yt-dlp for streaming")
+    )
 
     proc = subprocess.Popen(  # noqa: S603 - args are constructed safely above
         cmd,
@@ -287,6 +700,85 @@ def stream_download(
                     proc.returncode,
                     stderr_bytes.decode(errors="replace")[:500],
                 )
+
+    content_type = "video/mp4" if ext == "mp4" else f"video/{ext}"
+    return _iter(), filename, content_type
+
+
+def _download_via_tempfile(
+    *,
+    url: str,
+    selector: str,
+    safe_title: str,
+    platform: Platform,
+) -> tuple[Iterator[bytes], str, str]:
+    tmpdir = Path(tempfile.mkdtemp(prefix="snapreel_"))
+    output_template = tmpdir / "video.%(ext)s"
+
+    cmd: list[str] = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        *_BASE_YTDLP_FLAGS,
+        "--merge-output-format",
+        "mp4",
+    ]
+    cookiefile = _resolve_cookiefile(platform)
+    if cookiefile:
+        cmd.extend(["--cookies", cookiefile])
+    cmd.extend(["-f", selector, "-o", str(output_template), url])
+    logger.info(
+        "Spawning yt-dlp for tempfile download (platform=%s, cookies=%s, selector=%s)",
+        platform,
+        bool(cookiefile),
+        selector,
+    )
+
+    try:
+        result = subprocess.run(  # noqa: S603 - args are constructed safely above
+            cmd,
+            capture_output=True,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired as exc:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise DownloaderError(
+            "Download took too long. Try a smaller quality or another URL.",
+            status_code=504,
+        ) from exc
+
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="replace")
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        logger.warning("yt-dlp tempfile download failed: %s", stderr[:500])
+        raise DownloaderError(_friendly_error(stderr), status_code=400)
+
+    produced = sorted(
+        (p for p in tmpdir.iterdir() if p.is_file()),
+        key=lambda p: p.stat().st_size,
+        reverse=True,
+    )
+    if not produced:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise DownloaderError(
+            "No video file was produced.",
+            status_code=502,
+        )
+
+    produced_path = produced[0]
+    ext = produced_path.suffix.lstrip(".").lower() or "mp4"
+    filename = f"{safe_title}.{ext}"
+
+    def _iter() -> Iterator[bytes]:
+        try:
+            with produced_path.open("rb") as fh:
+                while True:
+                    chunk = fh.read(64 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     content_type = "video/mp4" if ext == "mp4" else f"video/{ext}"
     return _iter(), filename, content_type

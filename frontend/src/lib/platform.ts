@@ -3,7 +3,7 @@ import type { Platform } from "@/lib/api";
 const PATTERNS: Array<[Platform, RegExp]> = [
   ["tiktok", /(^|\.)tiktok\.com$|^vm\.tiktok\.com$|^vt\.tiktok\.com$/i],
   ["instagram", /(^|\.)instagram\.com$|^instagr\.am$/i],
-  ["facebook", /(^|\.)facebook\.com$|^fb\.watch$|^fb\.com$/i],
+  ["facebook", /(^|\.)facebook\.com$|^fb\.watch$|^fb\.com$|^l\.facebook\.com$|^lm\.facebook\.com$/i],
   ["youtube", /(^|\.)youtube\.com$|^youtu\.be$|^youtube-nocookie\.com$/i],
 ];
 
